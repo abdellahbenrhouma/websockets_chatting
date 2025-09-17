@@ -104,39 +104,60 @@ server.on('connection', socket => {
                 return;
             }
 
-            // Messaging
+            // inside message handler
+
+            if (msg.type === 'leave_room') {
+                if (socket.room && rooms.has(socket.room)) {
+                    const room = rooms.get(socket.room);
+                    room.members.delete(socket);
+                    if (room.members.size === 0) {
+                        rooms.delete(socket.room);
+                        console.log(`Room ${socket.room} deleted`);
+                    }
+                    socket.room = null;
+                    socket.send(JSON.stringify({ type: 'room_left' }));
+                }
+                return;
+            }
+
             if (msg.type === 'message') {
                 const text = msg.text.trim();
                 if (!text) return;
-
+                        
                 const now = new Date().toLocaleTimeString();
+                        
+                const isHashedPublic = text.startsWith('#'); // only # messages are blue
+                const isInRoom = !!socket.room;
+                        
                 const payload = JSON.stringify({
                     type: 'message',
                     name: socket.username,
-                    text,
-                    time: now
+                    text: isHashedPublic ? text.substring(1).trim() : text,
+                    time: now,
+                    isPublic: isHashedPublic // only true for # messages
                 });
-
-                // Public message
-                if (text.startsWith('#') || !socket.room) {
-                    // 🔓 Public message: if starts with '#' OR not in any room
+            
+                if (!isInRoom || isHashedPublic) {
                     for (let client of clients) {
-                        if (client.readyState === WebSocket.OPEN) {
+                        const isTargetInRoom = client.room;
+                        if (client.readyState === WebSocket.OPEN && (!isTargetInRoom || isHashedPublic)) {
                             client.send(payload);
                         }
                     }
-                } else {
-                    // 🔒 Private message to room
-                    const roomData = rooms.get(socket.room);
-                    if (roomData) {
-                        for (let member of roomData.members) {
-                            if (member.readyState === WebSocket.OPEN) {
-                                member.send(payload);
-                            }
+                } else if (isInRoom && rooms.has(socket.room)) {
+                    const room = rooms.get(socket.room);
+                    for (let member of room.members) {
+                        if (member.readyState === WebSocket.OPEN) {
+                            member.send(payload);
                         }
                     }
                 }
             }
+
+
+
+            
+
 
         } catch (err) {
             console.error("Error parsing message:", raw);
