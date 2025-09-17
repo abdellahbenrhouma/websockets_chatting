@@ -1,102 +1,150 @@
-const WebSocket = require ('ws');
-const server = new WebSocket.Server({port:8080});
+const WebSocket = require('ws');
+const server = new WebSocket.Server({ port: 8080 });
 
-const clients = new Set();
-const usernames = new Set();
-const anonymousNumbers = new Set(); // e.g. contains [1, 2, 4]
+const clients = new Set(); // all connected sockets
+const usernames = new Set(); // to avoid duplicates
+const anonymousNumbers = new Set(); // anonymous1, 2, etc.
+
+const rooms = new Map(); // roomName -> { capacity: number, members: Set<socket> }
 
 function getNextAnonymousName() {
     let i = 1;
-    while (anonymousNumbers.has(i)) {
-        i++;
-    }
+    while (anonymousNumbers.has(i)) i++;
     anonymousNumbers.add(i);
     return `anonymous${i}`;
 }
 
+function cleanupUser(socket) {
+    if (socket.username) {
+        usernames.delete(socket.username);
+        const match = socket.username.match(/^anonymous(\d+)$/);
+        if (match) anonymousNumbers.delete(Number(match[1]));
+    }
+
+    // Remove user from their room
+    if (socket.room && rooms.has(socket.room)) {
+        const room = rooms.get(socket.room);
+        room.members.delete(socket);
+        if (room.members.size === 0) {
+            rooms.delete(socket.room);
+            console.log(`Room ${socket.room} deleted`);
+        }
+    }
+}
+
 server.on('connection', socket => {
-    console.log('New client connected');
     clients.add(socket);
-
     socket.username = null;
+    socket.room = null;
 
-    socket.on('message', msg => {
+    socket.on('message', raw => {
         try {
-            const parsed = JSON.parse(msg);
+            const msg = JSON.parse(raw);
 
-            // First message must be a registration
-            if (!socket.username) {
-                if (parsed.type === 'register') {
-                    let requestedName = (parsed.name || '').trim();
-
-                    // Handle anonymous
-                    if (!requestedName || requestedName.toLowerCase() === 'anonymous') {
-                        requestedName = getNextAnonymousName();
-                    } else if (usernames.has(requestedName)) {
-                        // Name taken, send error and return
-                        socket.send(JSON.stringify({
-                            type: 'error',
-                            error: 'name_taken'
-                        }));
-                        return;
-                    }
-
-                    // Register the username
-                    socket.username = requestedName;
-                    usernames.add(requestedName);
-
-                    // Acknowledge registration
-                    socket.send(JSON.stringify({
-                        type: 'registered',
-                        name: requestedName
-                    }));
-
-                    return;
-                } else {
-                    // Must register first
-                    socket.send(JSON.stringify({
-                        type: 'error',
-                        error: 'must_register_first'
-                    }));
-                    return;
+            // Registration
+            if (!socket.username && msg.type === 'register') {
+                let name = (msg.name || '').trim();
+                if (!name || name.toLowerCase() === 'anonymous') {
+                    name = getNextAnonymousName();
+                } else if (usernames.has(name)) {
+                    return socket.send(JSON.stringify({ type: 'error', error: 'name_taken' }));
                 }
+
+                socket.username = name;
+                usernames.add(name);
+                socket.send(JSON.stringify({ type: 'registered', name }));
+                return;
             }
 
-            // Handle normal chat messages
-            if (parsed.type === 'message' && typeof parsed.text === 'string') {
-                const now = new Date();
-                const timestamp = now.toLocaleTimeString();
+            // Must register before doing anything else
+            if (!socket.username) {
+                return socket.send(JSON.stringify({ type: 'error', error: 'must_register_first' }));
+            }
 
-                const formattedMessage = JSON.stringify({
+            // Create Room
+            if (msg.type === 'create_room') {
+                if (rooms.size >= 4) {
+                    return socket.send(JSON.stringify({ type: 'error', error: 'server_full' }));
+                }
+
+                const roomName = msg.room.trim();
+                const capacity = parseInt(msg.capacity, 10);
+
+                if (!roomName || rooms.has(roomName)) {
+                    return socket.send(JSON.stringify({ type: 'error', error: 'room_exists_or_invalid' }));
+                }
+
+                if (![4, 5, 6].includes(capacity)) {
+                    return socket.send(JSON.stringify({ type: 'error', error: 'invalid_capacity' }));
+                }
+
+                rooms.set(roomName, { capacity, members: new Set([socket]) });
+                socket.room = roomName;
+
+                socket.send(JSON.stringify({ type: 'room_joined', room: roomName }));
+                return;
+            }
+
+            // Join Room
+            if (msg.type === 'join_room') {
+                const roomName = msg.room.trim();
+                if (!rooms.has(roomName)) {
+                    return socket.send(JSON.stringify({ type: 'error', error: 'room_not_found' }));
+                }
+
+                const room = rooms.get(roomName);
+                if (room.members.size >= room.capacity) {
+                    return socket.send(JSON.stringify({ type: 'error', error: 'room_full' }));
+                }
+
+                room.members.add(socket);
+                socket.room = roomName;
+
+                socket.send(JSON.stringify({ type: 'room_joined', room: roomName }));
+                return;
+            }
+
+            // Messaging
+            if (msg.type === 'message') {
+                const text = msg.text.trim();
+                if (!text) return;
+
+                const now = new Date().toLocaleTimeString();
+                const payload = JSON.stringify({
                     type: 'message',
                     name: socket.username,
-                    text: parsed.text.trim(),
-                    time: timestamp
+                    text,
+                    time: now
                 });
 
-                for (let client of clients) {
-                    if (client.readyState === WebSocket.OPEN) {
-                        client.send(formattedMessage);
+                // Public message
+                if (text.startsWith('#') || !socket.room) {
+                    // 🔓 Public message: if starts with '#' OR not in any room
+                    for (let client of clients) {
+                        if (client.readyState === WebSocket.OPEN) {
+                            client.send(payload);
+                        }
+                    }
+                } else {
+                    // 🔒 Private message to room
+                    const roomData = rooms.get(socket.room);
+                    if (roomData) {
+                        for (let member of roomData.members) {
+                            if (member.readyState === WebSocket.OPEN) {
+                                member.send(payload);
+                            }
+                        }
                     }
                 }
             }
 
         } catch (err) {
-            console.error('Invalid message:', msg);
+            console.error("Error parsing message:", raw);
         }
     });
 
     socket.on('close', () => {
-        console.log('Client disconnected');
+        cleanupUser(socket);
         clients.delete(socket);
-        if (socket.username) {
-            usernames.delete(socket.username);
-
-            const anonMatch = socket.username.match(/^anonymous(\d+)$/);
-            if (anonMatch) {
-                const num = parseInt(anonMatch[1], 10);
-                anonymousNumbers.delete(num); // Free the anonymous number
-            }
-        }
     });
 });
